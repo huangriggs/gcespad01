@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>學校平板電腦雲端管理系統</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
+    <!-- CSV 處理庫 -->
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <!-- Firebase 核心庫 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, query, onSnapshot, addDoc, updateDoc, deleteDoc, serverTimestamp, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Firebase 配置 (由環境自動注入)
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'tablet-manager-v1';
+
+        // --- 應用程式狀態管理 ---
+        window.state = {
+            user: null,
+            tablets: [],
+            logs: [],
+            models: ['iPad (9th Generation)', 'iPad (10th Generation)', 'Surface Go 3'],
+            assignTarget: 'student', // student 或 teacher
+            activeTab: 'dashboard',
+            searchQuery: '',
+            isLoading: true,
+            isProcessing: false,
+            stats: { total: 0, assigned: 0, available: 0, repair: 0 }
+        };
+
+        // --- 身份驗證 ---
+        async function initAuth() {
+            try {
+                await signInAnonymously(auth);
+            } catch (error) {
+                console.error("Auth error:", error);
+                showToast("雲端連線失敗", "error");
+            }
+        }
+
+        onAuthStateChanged(auth, (user) => {
+            window.state.user = user;
+            if (user) {
+                setupRealtimeListeners(user.uid);
+            }
+        });
+
+        // --- 實時資料監聽 ---
+        function setupRealtimeListeners(userId) {
+            const tabletsRef = collection(db, 'artifacts', appId, 'users', userId, 'tablets');
+            const logsRef = collection(db, 'artifacts', appId, 'users', userId, 'logs');
+            const settingsRef = doc(db, 'artifacts', appId, 'users', userId, 'settings', 'config');
+
+            // 監聽設備清單
+            onSnapshot(tabletsRef, (snapshot) => {
+                const tablets = [];
+                snapshot.forEach(doc => tablets.push({ id: doc.id, ...doc.data() }));
+                window.state.tablets = tablets;
+                updateStats();
+                window.state.isLoading = false;
+                render();
+            }, (err) => showToast("讀取設備失敗", "error"));
+
+            // 監聽日誌
+            onSnapshot(logsRef, (snapshot) => {
+                const logs = [];
+                snapshot.forEach(doc => logs.push({ id: doc.id, ...doc.data() }));
+                window.state.logs = logs.sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0));
+                render();
+            });
+
+            // 監聽自定義型號
+            onSnapshot(settingsRef, (docSnap) => {
+                if (docSnap.exists() && docSnap.data().models) {
+                    window.state.models = docSnap.data().models;
+                    render();
+                }
+            });
+        }
+
+        // --- 核心業務邏輯 ---
+        window.actions = {
+            setTab: (tab) => {
+                window.state.activeTab = tab;
+                render();
+            },
+            
+            setAssignTarget: (target) => {
+                window.state.assignTarget = target;
+                render();
+            },
+
+            setSearch: (e) => {
+                window.state.searchQuery = e.target.value.toLowerCase();
+                render();
+            },
+
+            // 1. 新增設備
+            addTablet: async (e) => {
+                e.preventDefault();
+                if (!window.state.user) return;
+                window.state.isProcessing = true;
+                render();
+
+                const formData = new FormData(e.target);
+                const sn = formData.get('sn').trim();
+                const assetId = formData.get('assetId').trim();
+
+                try {
+                    const tabletRef = doc(db, 'artifacts', appId, 'users', window.state.user.uid, 'tablets', sn);
+                    await setDoc(tabletRef, {
+                        sn,
+                        assetId, // 非必填
+                        model: formData.get('model'),
+                        status: 'Available',
+                        studentId: '',
+                        studentName: '',
+                        classInfo: '',
+                        userType: '',
+                        lastUpdated: serverTimestamp()
+                    });
+                    
+                    await actions.addLog(sn, '新增設備', '系統管理員');
+                    e.target.reset();
+                    showToast("設備已加入雲端庫存");
+                } catch (err) {
+                    showToast("新增失敗", "error");
+                } finally {
+                    window.state.isProcessing = false;
+                    render();
+                }
+            },
+
+            // 2. 管理型號
+            addNewModel: async () => {
+                const newModel = prompt("請輸入新平板型號名稱：");
+                if (!newModel || newModel.trim() === "") return;
+                const updatedModels = [...new Set([...window.state.models, newModel.trim()])];
+                const settingsRef = doc(db, 'artifacts', appId, 'users', window.state.user.uid, 'settings', 'config');
+                try {
+                    await setDoc(settingsRef, { models: updatedModels }, { merge: true });
+                    showToast("型號清單已更新");
+                } catch (err) {
+                    showToast("型號更新失敗", "error");
+                }
+            },
+
+            // 3. 執行派發
+            assignTablet: async (e) => {
+                e.preventDefault();
+                if (!window.state.user) return;
+                const formData = new FormData(e.target);
+                const sn = formData.get('sn').trim();
+                const target = window.state.assignTarget;
+                
+                let studentName, studentId, classInfo;
+
+                if (target === 'student') {
+                    studentName = formData.get('studentName').trim();
+                    studentId = formData.get('studentId').trim();
+                    classInfo = formData.get('classInfo').trim();
+                    if (!/^\d{5}$/.test(classInfo)) return showToast("班級座號必須為 5 位數字", "error");
+                } else {
+                    studentName = formData.get('teacherName').trim();
+                    studentId = "教師專用";
+                    classInfo = formData.get('teacherTitle');
+                }
+
+                const tablet = window.state.tablets.find(t => t.sn === sn);
+                if (!tablet) return showToast("找不到此序號設備", "error");
+                if (tablet.status === 'Assigned') return showToast("警告：此設備已在派發中", "error");
+
+                window.state.isProcessing = true;
+                render();
+
+                try {
+                    const tabletRef = doc(db, 'artifacts', appId, 'users', window.state.user.uid, 'tablets', sn);
+                    await updateDoc(tabletRef, {
+                        status: 'Assigned',
+                        studentName,
+                        studentId,
+                        classInfo,
+                        userType: target,
+                        lastUpdated: serverTimestamp()
+                    });
+                    await actions.addLog(sn, `派發成功 -> ${studentName}`, '系統管理員');
+                    showToast(`已成功派發給 ${studentName}`);
+                    e.target.reset();
+                } catch (err) {
+                    showToast("派發程序出錯", "error");
+                } finally {
+                    window.state.isProcessing = false;
+                    render();
+                }
+            },
+
+            // 4. 快速歸還 (掃描區)
+            quickReturn: async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const sn = formData.get('returnSn').trim();
+                if (!sn) return;
+                
+                const tablet = window.state.tablets.find(t => t.sn === sn);
+                if (!tablet) return showToast("查無此序號", "error");
+                if (tablet.status !== 'Assigned') return showToast("此設備目前已在庫存中", "error");
+
+                window.state.isProcessing = true;
+                render();
+
+                try {
+                    const tabletRef = doc(db, 'artifacts', appId, 'users', window.state.user.uid, 'tablets', sn);
+                    await updateDoc(tabletRef, {
+                        status: 'Available',
+                        studentName: '',
+                        studentId: '',
+                        classInfo: '',
+                        userType: '',
+                        lastUpdated: serverTimestamp()
+                    });
+                    await actions.addLog(sn, '快速掃描歸還', '系統管理員');
+                    showToast("歸還手續完成");
+                    e.target.reset();
+                } catch (err) {
+                    showToast("歸還失敗", "error");
+                } finally {
+                    window.state.isProcessing = false;
+                    render();
+                }
+            },
+
+            // 5. 雲端備份下載 (指定格式檔名)
+            backupData: () => {
+                if (window.state.tablets.length === 0) return showToast("庫存為空，無需備份", "error");
+                const data = window.state.tablets.map(({id, lastUpdated, ...rest}) => rest);
+                const csv = Papa.unparse(data);
+                const blob = new Blob(["\ufeff" + csv], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+                // 檔名格式：西元年+月+日+時間
+                const timestamp = dayjs().format('YYYYMMDD_HHmm');
+                link.href = URL.createObjectURL(blob);
+                link.setAttribute("download", `Tablet_Backup_${timestamp}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showToast("雲端資料已匯出");
+            },
+
+            // 6. 下載還原範例
+            downloadExample: () => {
+                const exampleData = [
+                    { sn: "SN12345678", assetId: "P1130001", model: "iPad (9th Generation)", status: "Available", studentName: "", studentId: "", classInfo: "", userType: "" },
+                    { sn: "SN87654321", assetId: "P1130002", model: "Surface Go 3", status: "Assigned", studentName: "王小明", studentId: "112001", classInfo: "10203", userType: "student" }
+                ];
+                const csv = Papa.unparse(exampleData);
+                const blob = new Blob(["\ufeff" + csv], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+                link.href = URL.createObjectURL(blob);
+                link.setAttribute("download", `還原範例_Tablet_Example.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                showToast("範例檔已下載");
+            },
+
+            // 7. CSV 還原匯入
+            restoreData: (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                if (!confirm("確定要執行雲端還原？這將會更新或新增所有對應序號的資料。")) return;
+                window.state.isProcessing = true;
+                render();
+                Papa.parse(file, {
+                    header: true,
+                    skipEmptyLines: true,
+                    complete: async (results) => {
+                        try {
+                            const batch = writeBatch(db);
+                            for (const row of results.data) {
+                                if (!row.sn) continue;
+                                const ref = doc(db, 'artifacts', appId, 'users', window.state.user.uid, 'tablets', row.sn.trim());
+                                const cleanData = {};
+                                Object.keys(row).forEach(key => {
+                                    cleanData[key] = (row[key] || "").toString().trim();
+                                });
+                                batch.set(ref, { ...cleanData, lastUpdated: serverTimestamp() }, { merge: true });
+                            }
+                            await batch.commit();
+                            showToast(`還原完成，處理 ${results.data.length} 筆資料`);
+                        } catch (err) { 
+                            showToast("還原失敗，請檢查 CSV 格式", "error"); 
+                        }
+                        finally { window.state.isProcessing = false; e.target.value = ""; render(); }
+                    }
+                });
+            },
+
+            // 8. 狀態手動更新
+            updateStatus: async (sn, newStatus) => {
+                const tabletRef = doc(db, 'artifacts', appId, 'users', window.state.user.uid, 'tablets', sn);
+                try {
+                    await updateDoc(tabletRef, { status: newStatus, lastUpdated: serverTimestamp() });
+                    await actions.addLog(sn, `狀態異動 -> ${newStatus}`, '系統管理員');
+                    showToast("狀態更新成功");
+                } catch (err) { showToast("更新失敗", "error"); }
+            },
+
+            addLog: async (sn, action, operator) => {
+                const logsRef = collection(db, 'artifacts', appId, 'users', window.state.user.uid, 'logs');
+                await addDoc(logsRef, { sn, action, operator, timestamp: serverTimestamp() });
+            }
+        };
+
+        function updateStats() {
+            const t = window.state.tablets;
+            window.state.stats = {
+                total: t.length,
+                assigned: t.filter(x => x.status === 'Assigned').length,
+                available: t.filter(x => x.status === 'Available').length,
+                repair: t.filter(x => x.status === 'Repair').length
+            };
+        }
+
+        function showToast(msg, type = 'success') {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.className = `fixed bottom-4 right-4 px-6 py-3 rounded-lg shadow-xl text-white z-50 transition-all duration-300 ${type === 'success' ? 'bg-blue-600' : 'bg-red-600'}`;
+            toast.style.opacity = '1';
+            toast.style.transform = 'translateY(0)';
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(20px)';
+            }, 3000);
+        }
+
+        // --- 渲染引擎 ---
+        function render() {
+            const app = document.getElementById('app');
+            const { activeTab, tablets, logs, stats, searchQuery, isLoading, isProcessing, models, assignTarget } = window.state;
+
+            if (isLoading) {
+                app.innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-screen bg-slate-50">
+                        <div class="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+                        <div class="text-slate-500 font-bold tracking-widest">雲端同步中...</div>
+                    </div>`;
+                return;
+            }
+
+            const filteredTablets = tablets.filter(t => 
+                t.sn?.toLowerCase().includes(searchQuery) || 
+                t.assetId?.toLowerCase().includes(searchQuery) ||
+                t.studentName?.toLowerCase().includes(searchQuery) ||
+                t.studentId?.toLowerCase().includes(searchQuery)
+            );
+
+            app.innerHTML = `
+                <div class="min-h-screen bg-slate-50 flex flex-col font-sans">
+                    <!-- 頂部導航 -->
+                    <header class="bg-slate-900 text-white shadow-lg no-print">
+                        <div class="container mx-auto px-6 h-18 flex items-center justify-between">
+                            <div class="flex items-center space-x-3 cursor-pointer" onclick="actions.setTab('dashboard')">
+                                <div class="bg-blue-600 p-2 rounded-lg shadow-inner">
+                                    <i data-lucide="tablet" class="w-6 h-6"></i>
+                                </div>
+                                <span class="text-xl font-black tracking-tight uppercase">Tablet Admin <span class="text-blue-500 font-light">Pro</span></span>
+                            </div>
+                            <nav class="flex space-x-1">
+                                ${['dashboard', 'inventory', 'assign', 'history'].map(tab => `
+                                    <button onclick="actions.setTab('${tab}')" class="px-5 py-2.5 rounded-lg transition-all text-sm font-bold tracking-wide ${activeTab === tab ? 'bg-white/10 text-blue-400' : 'text-slate-400 hover:text-white hover:bg-white/5'}">
+                                        ${tab === 'dashboard' ? '儀表板' : tab === 'inventory' ? '庫存清單' : tab === 'assign' ? '派發/歸還' : '異動日誌'}
+                                    </button>
+                                `).join('')}
+                            </nav>
+                        </div>
+                    </header>
+
+                    <main class="flex-1 container mx-auto px-6 py-8">
+                        <!-- 處理遮罩 -->
+                        ${isProcessing ? `<div class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex items-center justify-center"><div class="bg-white p-8 rounded-2xl shadow-2xl flex items-center space-x-4"><i data-lucide="refresh-cw" class="animate-spin text-blue-600"></i><span class="font-black text-slate-800">程序執行中...</span></div></div>` : ''}
+                        
+                        ${activeTab === 'dashboard' ? renderDashboard(stats, models) : ''}
+                        ${activeTab === 'inventory' ? renderInventory(filteredTablets) : ''}
+                        ${activeTab === 'assign' ? renderAssign(assignTarget) : ''}
+                        ${activeTab === 'history' ? renderHistory(logs) : ''}
+                    </main>
+
+                    <footer class="py-6 text-center text-slate-400 text-[10px] uppercase font-bold tracking-widest no-print">
+                        Cloud Database Connected | ID: ${window.state.user?.uid} | v3.4 Solid
+                    </footer>
+                </div>
+            `;
+            lucide.createIcons();
+        }
+
+        function renderDashboard(stats, models) {
+            return `
+                <div class="grid grid-cols-2 lg:grid-cols-4 gap-6 mb-10">
+                    ${renderStatCard('總計庫存', stats.total, 'package', 'bg-slate-800')}
+                    ${renderStatCard('目前派發', stats.assigned, 'user-check', 'bg-blue-600')}
+                    ${renderStatCard('在席可用', stats.available, 'check-circle', 'bg-emerald-600')}
+                    ${renderStatCard('報修待理', stats.repair, 'alert-triangle', 'bg-amber-600')}
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                    <div class="lg:col-span-2 bg-white p-8 rounded-3xl shadow-sm border border-slate-200">
+                        <h3 class="text-xl font-black mb-6 flex items-center text-slate-800"><i data-lucide="plus-square" class="mr-3 text-blue-600"></i> 快速入庫作業</h3>
+                        <form onsubmit="actions.addTablet(event)" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div class="md:col-span-2">
+                                <label class="block text-xs font-black text-slate-400 uppercase mb-2">設備序號 (SN) *</label>
+                                <input name="sn" required class="w-full bg-slate-50 border-0 rounded-2xl p-4 text-lg font-mono focus:ring-4 focus:ring-blue-100 outline-none transition" placeholder="掃描或輸入序號">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-black text-slate-400 uppercase mb-2">財產編號 (非必填)</label>
+                                <input name="assetId" class="w-full bg-slate-50 border-0 rounded-2xl p-4 focus:ring-4 focus:ring-blue-100 outline-none transition" placeholder="P113xxxx">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-black text-slate-400 uppercase mb-2">型號 *</label>
+                                <div class="flex space-x-2">
+                                    <select name="model" required class="flex-1 bg-slate-50 border-0 rounded-2xl p-4 focus:ring-4 focus:ring-blue-100 outline-none transition bg-white">
+                                        ${models.map(m => `<option value="${m}">${m}</option>`).join('')}
+                                    </select>
+                                    <button type="button" onclick="actions.addNewModel()" class="p-4 bg-slate-100 rounded-2xl hover:bg-slate-200 transition text-slate-600"><i data-lucide="plus"></i></button>
+                                </div>
+                            </div>
+                            <button type="submit" class="md:col-span-2 bg-slate-900 text-white py-5 rounded-2xl font-black text-lg hover:bg-slate-800 shadow-xl shadow-slate-200 transition active:scale-95">確認新增至雲端</button>
+                        </form>
+                    </div>
+                    <div class="bg-blue-600 p-8 rounded-3xl shadow-xl text-white flex flex-col justify-between">
+                        <div>
+                            <h3 class="text-xl font-black mb-4 flex items-center"><i data-lucide="info" class="mr-3"></i> 系統通告</h3>
+                            <p class="text-blue-100 text-sm leading-relaxed mb-6 font-medium">歡迎組長！本系統已完成 1,500 台規模優化，支援實時同步與 CSV 備份。請確保在派發學生時班級資訊填寫正確。</p>
+                        </div>
+                        <div class="bg-white/10 p-5 rounded-2xl border border-white/20">
+                            <div class="text-[10px] font-black uppercase mb-1">Backup Recommendation</div>
+                            <div class="text-xs">建議每週五下班前執行匯出備份。</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderStatCard(title, value, icon, color) {
+            return `
+                <div class="bg-white p-6 rounded-3xl shadow-sm border border-slate-200 flex items-center justify-between hover:border-blue-400 transition-colors cursor-default">
+                    <div><p class="text-slate-400 text-xs font-black uppercase mb-1">${title}</p><p class="text-4xl font-black text-slate-900">${value}</p></div>
+                    <div class="${color} p-4 rounded-2xl text-white shadow-lg"><i data-lucide="${icon}"></i></div>
+                </div>
+            `;
+        }
+
+        function renderInventory(tablets) {
+            return `
+                <div class="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
+                    <div class="p-6 bg-slate-50 border-b flex flex-wrap items-center justify-between gap-6">
+                        <div class="relative flex-1 min-w-[350px]">
+                            <i data-lucide="search" class="absolute left-4 top-3.5 text-slate-400 w-5 h-5"></i>
+                            <input type="text" oninput="actions.setSearch(event)" value="${window.state.searchQuery}" placeholder="搜尋序號、學號、姓名或班級..." class="pl-12 pr-6 py-3.5 w-full bg-white border-0 rounded-2xl text-sm font-bold shadow-sm outline-none focus:ring-4 focus:ring-blue-100 transition">
+                        </div>
+                        <div class="flex items-center space-x-3">
+                            <button onclick="actions.backupData()" class="px-6 py-3.5 bg-blue-600 text-white rounded-2xl text-sm font-black hover:bg-blue-700 shadow-lg shadow-blue-100 transition flex items-center"><i data-lucide="download" class="mr-2 w-4 h-4"></i>備份</button>
+                            <div class="flex items-center bg-slate-200 p-1 rounded-2xl">
+                                <label class="px-6 py-2.5 bg-slate-700 text-white rounded-xl text-sm font-black hover:bg-slate-800 cursor-pointer transition">還原<input type="file" accept=".csv" class="hidden" onchange="actions.restoreData(event)"></label>
+                                <button onclick="actions.downloadExample()" title="範例下載" class="p-2.5 text-slate-500 hover:text-slate-800 transition"><i data-lucide="help-circle"></i></button>
+                            </div>
+                            <button onclick="window.print()" class="p-3.5 bg-white border rounded-2xl hover:bg-slate-100 text-slate-600 no-print transition"><i data-lucide="printer"></i></button>
+                        </div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table class="w-full text-left border-collapse">
+                            <thead><tr class="bg-slate-100/50 text-slate-500 text-[10px] uppercase font-black"><th class="px-8 py-5">設備與序號</th><th class="px-8 py-5">雲端狀態</th><th class="px-8 py-5">借用人資訊</th><th class="px-8 py-5">班級/職別</th><th class="px-8 py-5">系統操作</th></tr></thead>
+                            <tbody class="divide-y divide-slate-100 text-sm">
+                                ${tablets.length === 0 ? `<tr><td colspan="5" class="px-8 py-20 text-center font-bold text-slate-400 italic">目前雲端無設備資料</td></tr>` : 
+                                  filteredTablets.map(t => `
+                                    <tr class="hover:bg-blue-50/30 transition-colors">
+                                        <td class="px-8 py-5"><div class="font-black text-slate-800 text-base">${t.sn}</div><div class="text-[10px] font-bold text-slate-400 mt-0.5">${t.assetId || 'N/A'} — ${t.model}</div></td>
+                                        <td class="px-8 py-5"><span class="px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider ${t.status === 'Assigned' ? 'bg-blue-100 text-blue-700' : t.status === 'Available' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}">${t.status === 'Assigned' ? '派發中' : t.status === 'Available' ? '在庫' : '報修'}</span></td>
+                                        <td class="px-8 py-5 text-slate-700 font-bold">${t.studentName ? `${t.studentName} <span class="text-xs text-slate-400 ml-1">(${t.studentId})</span>` : '<span class="text-slate-200 italic font-normal">未指派</span>'}</td>
+                                        <td class="px-8 py-5 font-mono text-slate-500 font-bold">${t.classInfo || '-'}</td>
+                                        <td class="px-8 py-5 space-x-3">
+                                            ${t.status === 'Assigned' ? `<button onclick="actions.returnTablet('${t.sn}')" class="text-blue-600 font-black hover:underline text-xs">手動歸還</button>` : `<select onchange="actions.updateStatus('${t.sn}', this.value)" class="text-xs font-bold border rounded-xl p-2 bg-white outline-none focus:ring-2 focus:ring-blue-400"><option value="" disabled selected>更改</option><option value="Available">在庫</option><option value="Repair">報修</option></select>`}
+                                        </td>
+                                    </tr>
+                                `).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderAssign(assignTarget) {
+            const teacherTitles = ["校長", "主任", "組長", "導師", "專科教師", "校護", "服務員", "外師", "幹事", "午餐主祕"];
+            
+            return `
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                    <!-- 左側：派發區塊 -->
+                    <div class="bg-white p-10 rounded-[2.5rem] shadow-sm border border-slate-200">
+                        <div class="flex items-center justify-between mb-10">
+                            <h2 class="text-2xl font-black text-slate-800 flex items-center"><i data-lucide="send" class="mr-4 text-blue-600"></i> 設備派發</h2>
+                            <div class="inline-flex rounded-2xl border-4 border-slate-100 p-1 bg-slate-100">
+                                <button onclick="actions.setAssignTarget('student')" class="px-6 py-2 rounded-xl text-xs font-black transition-all ${assignTarget === 'student' ? 'bg-white shadow-md text-blue-600' : 'text-slate-400'}">學生</button>
+                                <button onclick="actions.setAssignTarget('teacher')" class="px-6 py-2 rounded-xl text-xs font-black transition-all ${assignTarget === 'teacher' ? 'bg-white shadow-md text-blue-600' : 'text-slate-400'}">教師</button>
+                            </div>
+                        </div>
+
+                        <form onsubmit="actions.assignTablet(event)" class="space-y-8">
+                            <div>
+                                <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3">設備序號 (SN)</label>
+                                <input name="sn" required class="block w-full rounded-3xl border-0 bg-slate-50 p-6 text-2xl font-black font-mono text-blue-800 focus:bg-white focus:ring-8 focus:ring-blue-100 outline-none transition" placeholder="掃描條碼...">
+                            </div>
+
+                            ${assignTarget === 'student' ? `
+                                <div class="grid grid-cols-2 gap-6">
+                                    <div><label class="block text-[10px] font-black text-slate-400 uppercase mb-3">學生姓名</label><input name="studentName" required class="block w-full rounded-2xl border-0 bg-slate-50 p-4 focus:bg-white outline-none font-bold"></div>
+                                    <div><label class="block text-[10px] font-black text-slate-400 uppercase mb-3">學號</label><input name="studentId" required class="block w-full rounded-2xl border-0 bg-slate-50 p-4 focus:bg-white outline-none font-bold"></div>
+                                </div>
+                                <div>
+                                    <label class="block text-[10px] font-black text-slate-400 uppercase mb-1">班級座號 (5碼格式)</label>
+                                    <p class="text-[10px] text-blue-500 mb-3 font-bold underline">範例：一年2班3號 → 請填 10203</p>
+                                    <input name="classInfo" required maxlength="5" pattern="\\d{5}" class="block w-full rounded-2xl border-0 bg-slate-50 p-4 font-mono text-xl focus:bg-white outline-none font-black" placeholder="10203">
+                                </div>
+                            ` : `
+                                <div><label class="block text-[10px] font-black text-slate-400 uppercase mb-3">教師姓名</label><input name="teacherName" required class="block w-full rounded-2xl border-0 bg-slate-50 p-4 focus:bg-white outline-none font-bold"></div>
+                                <div>
+                                    <label class="block text-[10px] font-black text-slate-400 uppercase mb-3">職別</label>
+                                    <select name="teacherTitle" required class="block w-full rounded-2xl border-0 bg-slate-50 p-4 focus:bg-white outline-none font-bold bg-white">
+                                        ${teacherTitles.map(t => `<option value="${t}">${t}</option>`).join('')}
+                                    </select>
+                                </div>
+                            `}
+
+                            <button type="submit" class="w-full bg-blue-600 text-white py-6 rounded-[1.5rem] font-black text-xl hover:bg-blue-700 shadow-2xl shadow-blue-200 transition active:scale-95">確認執行派發</button>
+                        </form>
+                    </div>
+
+                    <!-- 右側：歸還區塊 -->
+                    <div class="bg-white p-10 rounded-[2.5rem] shadow-sm border border-slate-200 flex flex-col">
+                        <div class="flex items-center justify-between mb-10">
+                            <h2 class="text-2xl font-black text-slate-800 flex items-center"><i data-lucide="archive" class="mr-4 text-emerald-600"></i> 快速歸還</h2>
+                        </div>
+                        <div class="flex-1 p-8 bg-emerald-50 rounded-[2rem] border-4 border-dashed border-emerald-100 flex flex-col justify-center items-center text-center">
+                            <i data-lucide="scan" class="w-16 h-16 text-emerald-200 mb-6"></i>
+                            <p class="text-sm text-emerald-700 font-bold mb-8 max-w-[250px]">請將游標點擊下方輸入框，掃描設備上的序號條碼即可自動收回。</p>
+                            <form onsubmit="actions.quickReturn(event)" class="w-full space-y-4">
+                                <input name="returnSn" required class="block w-full rounded-2xl border-0 p-6 text-3xl font-black font-mono text-emerald-800 placeholder-emerald-200 shadow-inner focus:ring-8 focus:ring-emerald-200 outline-none transition text-center uppercase" placeholder="SCAN SN">
+                                <button type="submit" class="w-full bg-slate-800 text-white py-4 rounded-2xl font-black hover:bg-slate-900 transition shadow-lg">手動確認歸還</button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderHistory(logs) {
+            return `
+                <div class="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
+                    <div class="p-6 bg-slate-50 border-b font-black text-slate-400 text-xs uppercase tracking-widest">異動追蹤 (顯示最近 50 筆)</div>
+                    <div class="divide-y divide-slate-50">
+                        ${logs.slice(0, 50).map(log => `
+                            <div class="p-6 flex items-center justify-between hover:bg-slate-50 transition">
+                                <div class="flex items-center space-x-6">
+                                    <div class="bg-slate-100 p-3 rounded-2xl text-slate-500"><i data-lucide="activity" class="w-4 h-4"></i></div>
+                                    <div>
+                                        <div class="text-sm font-black text-slate-800 uppercase tracking-tight">${log.action}</div>
+                                        <div class="text-[10px] font-bold text-slate-400 mt-0.5">設備序號: ${log.sn} | 處理者: ${log.operator}</div>
+                                    </div>
+                                </div>
+                                <span class="text-[10px] font-black font-mono text-slate-400 bg-slate-100 px-3 py-1 rounded-full">
+                                    ${log.timestamp ? dayjs(log.timestamp.toDate()).format('YYYY/MM/DD HH:mm') : '處理中'}
+                                </span>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>`;
+        }
+
+        // --- 啟動初始化 ---
+        window.onload = async () => { 
+            await initAuth(); 
+            render(); 
+        };
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', -apple-system, system-ui, sans-serif; letter-spacing: -0.01em; }
+        input, select, button { transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); }
+        .no-print { @media print { display: none !important; } }
+        /* 隱藏捲軸 */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+    </style>
+</head>
+<body class="antialiased text-slate-900 bg-slate-50 overflow-x-hidden">
+    <div id="app"></div>
+    <div id="toast" class="opacity-0 pointer-events-none fixed z-[9999] transform translate-y-5"></div>
+</body>
+</html>
